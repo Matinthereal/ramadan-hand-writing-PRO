@@ -17,6 +17,7 @@
       justify-content: center;
       align-items: center;
       height: 100vh;
+      width: 100vw;
     }
     
     /* Container for the ring light effect */
@@ -26,6 +27,8 @@
       height: 70vh;
       max-width: 1000px;
       max-height: 750px;
+      min-width: 400px;
+      min-height: 300px;
     }
     
     /* Ring light border effect */
@@ -69,7 +72,7 @@
       z-index: 10;
     }
     
-    /* Video as background inside container */
+    /* Video as background inside container - NO TINT */
     video {
       position: absolute;
       top: 0;
@@ -79,8 +82,8 @@
       object-fit: cover;
       transform: scaleX(-1);
       z-index: 0;
-      opacity: 0.5;
-      filter: contrast(1.1) brightness(0.8) sepia(0.3) hue-rotate(-10deg);
+      opacity: 0.6;
+      filter: contrast(1.05) brightness(0.95);
       border-radius: 12px;
     }
     
@@ -129,10 +132,21 @@
     .corner-tr { top: -5px; right: -5px; border-left: none; border-bottom: none; }
     .corner-bl { bottom: -5px; left: -5px; border-right: none; border-top: none; }
     .corner-br { bottom: -5px; right: -5px; border-left: none; border-top: none; }
+    
+    /* Resize handle indicator */
+    .resize-hint {
+      position: absolute;
+      bottom: 10px;
+      right: 10px;
+      color: rgba(245, 208, 97, 0.5);
+      font-size: 10px;
+      z-index: 20;
+      pointer-events: none;
+    }
   </style>
 </head>
 <body>
-  <div class="container">
+  <div class="container" id="container">
     <div class="corner corner-tl"></div>
     <div class="corner corner-tr"></div>
     <div class="corner corner-bl"></div>
@@ -144,6 +158,8 @@
       <div class="instruction">[S] save drawing</div>
     </div>
     
+    <div class="resize-hint">resize window freely</div>
+    
     <video id="vid" playsinline></video>
     <canvas id="c"></canvas>
   </div>
@@ -153,7 +169,7 @@
     // KALMAN FILTER - for predictive smoothing
     // ==========================================
     class KalmanFilter {
-      constructor(R = 0.01, Q = 0.1) {
+      constructor(R = 0.008, Q = 0.12) {
         this.R = R;
         this.Q = Q;
         this.P = 1;
@@ -179,7 +195,7 @@
     // ONE EURO FILTER - adaptive smoothing
     // ==========================================
     class OneEuroFilter {
-      constructor(freq = 60, mincutoff = 1.0, beta = 0.007, dcutoff = 1.0) {
+      constructor(freq = 60, mincutoff = 0.8, beta = 0.005, dcutoff = 1.0) {
         this.freq = freq;
         this.mincutoff = mincutoff;
         this.beta = beta;
@@ -236,17 +252,23 @@
     var vid = document.getElementById('vid');
     var c = document.getElementById('c');
     var ctx = c.getContext('2d');
-    var container = document.querySelector('.container');
+    var container = document.getElementById('container');
+    
+    // Track container dimensions for accurate coordinate mapping
+    var containerRect = null;
+    var scaleX = 1;
+    var scaleY = 1;
     
     var strokes = [];
     var currentStroke = [];
     var isDrawing = false;
     var shiftPressed = false;
     
-    var kf_x = new KalmanFilter(0.008, 0.15);
-    var kf_y = new KalmanFilter(0.008, 0.15);
-    var euro_x = new OneEuroFilter(60, 0.5, 0.02, 1.0);
-    var euro_y = new OneEuroFilter(60, 0.5, 0.02, 1.0);
+    // Improved filters for windowed mode
+    var kf_x = new KalmanFilter(0.006, 0.1);
+    var kf_y = new KalmanFilter(0.006, 0.1);
+    var euro_x = new OneEuroFilter(60, 0.4, 0.008, 1.0);
+    var euro_y = new OneEuroFilter(60, 0.4, 0.008, 1.0);
     
     var rawPos = null;
     var smoothPos = null;
@@ -258,9 +280,26 @@
     var handDetected = false;
     var lostHandTimer = 0;
     var zDepth = 0;
+    var detectionQuality = 0;
     
     var lastTime = performance.now();
     var fps = 60;
+
+    // Update dimensions on resize
+    function updateDimensions() {
+      containerRect = container.getBoundingClientRect();
+      // Set canvas internal resolution to match display size for sharp rendering
+      if (c.width !== containerRect.width || c.height !== containerRect.height) {
+        c.width = containerRect.width;
+        c.height = containerRect.height;
+      }
+      // Calculate scale factors for coordinate mapping
+      scaleX = containerRect.width;
+      scaleY = containerRect.height;
+    }
+
+    window.addEventListener('resize', updateDimensions);
+    updateDimensions();
 
     window.onkeydown = function(e) {
       if (e.key === 'Shift') shiftPressed = true;
@@ -296,11 +335,20 @@
       fps = 0.9 * fps + 0.1 * (1 / dt);
       
       const ind = lm[8];
+      const wrist = lm[0];
+      const middle = lm[12];
+      
+      // Calculate detection quality based on landmark confidence
+      detectionQuality = (ind.visibility || 0.8) * 0.5 + (wrist.visibility || 0.8) * 0.5;
+      
       zDepth = ind.z || 0;
       
-      const rx = ind.x * c.width;
-      const ry = ind.y * c.height;
+      // Map normalized coordinates (0-1) to container dimensions
+      // MediaPipe returns normalized coordinates regardless of input resolution
+      const rx = ind.x * scaleX;
+      const ry = ind.y * scaleY;
       
+      // Apply stronger smoothing for windowed mode stability
       const kx = kf_x.update(rx);
       const ky = kf_y.update(ry);
       
@@ -336,6 +384,7 @@
       velocity = { x: 0, y: 0 };
       speed = 0;
       handDetected = false;
+      detectionQuality = 0;
     }
 
     function drawStroke(stroke, alpha = 1) {
@@ -361,17 +410,15 @@
     }
 
     function run(res) {
-      // Use container dimensions instead of window
-      const rect = container.getBoundingClientRect();
-      if (c.width !== rect.width || c.height !== rect.height) {
-        c.width = rect.width;
-        c.height = rect.height;
-      }
+      // Ensure dimensions are up to date
+      updateDimensions();
       
       ctx.clearRect(0, 0, c.width, c.height);
       
+      // Dynamic shadow based on detection quality
+      const qualityGlow = 10 + (detectionQuality * 20);
       ctx.shadowColor = '#F5D061';
-      ctx.shadowBlur = 20;
+      ctx.shadowBlur = qualityGlow;
       ctx.strokeStyle = '#F5D061';
       ctx.lineCap = 'round';
       ctx.lineJoin = 'round';
@@ -389,12 +436,19 @@
       if (res.multiHandLandmarks && res.multiHandLandmarks.length > 0) {
         const lm = res.multiHandLandmarks[0];
         
+        // Scale landmarks to container dimensions for drawing
+        const scaledLm = lm.map(p => ({
+          x: p.x * scaleX / c.width,
+          y: p.y * scaleY / c.height,
+          z: p.z
+        }));
+        
         ctx.shadowBlur = 0;
-        drawConnectors(ctx, lm, HAND_CONNECTIONS, {
+        drawConnectors(ctx, scaledLm, HAND_CONNECTIONS, {
           color: 'rgba(245, 208, 97, 0.2)', 
           lineWidth: 1
         });
-        drawLandmarks(ctx, lm, {
+        drawLandmarks(ctx, scaledLm, {
           color: 'rgba(255, 255, 255, 0.4)', 
           lineWidth: 1, 
           radius: 2
@@ -427,9 +481,11 @@
           ctx.stroke();
         }
         
+        // Improved drawing logic with better threshold for windowed mode
         if (shiftPressed) {
           if (!isDrawing) {
-            if (speed > 10 || currentStroke.length === 0) {
+            // Lower speed threshold for easier drawing in small windows
+            if (speed > 5 || currentStroke.length === 0) {
               isDrawing = true;
               currentStroke = [{ x: pos.x, y: pos.y, speed: speed, z: zDepth }];
             }
@@ -437,7 +493,10 @@
             const lastPoint = currentStroke[currentStroke.length - 1];
             const dist = vec2.dist(pos, lastPoint);
             
-            if (dist > 2) {
+            // Adaptive distance threshold based on window size
+            const minDist = Math.max(1.5, Math.min(3, scaleX * 0.002));
+            
+            if (dist > minDist) {
               currentStroke.push({ 
                 x: pos.x, 
                 y: pos.y, 
@@ -459,7 +518,7 @@
         
       } else {
         lostHandTimer++;
-        if (lostHandTimer > 10) {
+        if (lostHandTimer > 15) {
           if (isDrawing && currentStroke.length > 1) {
             strokes.push([...currentStroke]);
           }
@@ -479,16 +538,16 @@
     h.setOptions({ 
       maxNumHands: 1,
       modelComplexity: 1,
-      minDetectionConfidence: 0.7,
-      minTrackingConfidence: 0.7
+      minDetectionConfidence: 0.6,
+      minTrackingConfidence: 0.6
     });
     
     h.onResults(run);
 
     var cam = new Camera(vid, {
       onFrame: async () => { await h.send({image: vid}); },
-      width: 1920,
-      height: 1080,
+      width: 1280,
+      height: 720,
       facingMode: 'user'
     });
     
